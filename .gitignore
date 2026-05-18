@@ -1,11 +1,6 @@
 __pycache__/
 *.pyc
 
-data/*
-!data/.gitkeep
-
-models/*
-
 .ipynb_checkpoints/
 
 .env
