@@ -1,0 +1,470 @@
+================================================================
+  TÀI LIỆU PIPELINE — HỆ THỐNG DỰ ĐOÁN GIÁ NHÀ CHỢ TỐT
+  Ngày tạo: 2026-05-25
+================================================================
+
+
+================================================================
+1. scraped_chotot.py
+   Vị trí: notebooks/scraped_chotot.py
+================================================================
+
+MỤC ĐÍCH
+--------
+Thu thập (scrape) dữ liệu tin đăng bán bất động sản từ API
+công khai của Chợ Tốt. Lưu kết quả dưới dạng JSONL
+(mỗi dòng = 1 listing).
+
+OUTPUT
+------
+  data/chotot_scraped.jsonl   (40,896 records sau khi chạy)
+
+CÁCH CHẠY
+----------
+  python scraped_chotot.py
+  python scraped_chotot.py --max-pages 100 --output data/test.jsonl
+
+  --max-pages  : Số trang tối đa mỗi (category, region). Mặc định 200.
+  --output     : Đường dẫn file output. Mặc định data/chotot_scraped.jsonl.
+
+  Hỗ trợ resume: nếu file output đã tồn tại, script đọc các
+  list_id đã có và bỏ qua, tránh duplicate khi chạy lại.
+
+CẤU HÌNH
+---------
+  BASE_URL   : https://gateway.chotot.com/v1/public/ad-listing
+  LIMIT      : 50 listings/request
+  SLEEP      : 0.8s giữa các request (tránh rate limit)
+  RETRY      : 3 lần retry với exponential backoff (1s, 2s, 4s)
+
+  CATEGORIES (category_code → tên):
+    1020  nha_o      Nhà ở
+    1010  can_ho     Căn hộ / Chung cư
+    1030  dat        Đất
+    1040  van_phong  Văn phòng, Mặt bằng kinh doanh
+
+  REGIONS (tên → region_code API):
+    hcm         13000   TP. Hồ Chí Minh
+    hanoi       12000   Hà Nội
+    danang       3017   Đà Nẵng
+    binh_duong   2011   Bình Dương
+    dong_nai     2013   Đồng Nai
+    ba_ria       2010   Bà Rịa - Vũng Tàu
+    long_an      5032   Long An
+
+SCHEMA MỖI RECORD
+-----------------
+  list_id       ID duy nhất từ API Chợ Tốt (dùng để dedup)
+  title         Tiêu đề tin đăng
+  description   Mô tả chi tiết
+  price_vnd     Giá (VNĐ) — lọc: 100 triệu ≤ giá ≤ 500 tỷ
+  price_string  Giá dạng chuỗi ("5 tỷ")
+  area_m2       Diện tích (m²) — lọc: > 0
+  latitude      Vĩ độ GPS (có thể null ~0.2%)
+  longitude     Kinh độ GPS (có thể null ~0.2%)
+  ward          Phường / Xã
+  district      Quận / Huyện
+  city          Tỉnh / Thành phố
+  category_code Mã loại BĐS
+  category_name Tên loại BĐS
+  rooms         Số phòng ngủ (có thể null ~34%)
+  toilets       Số toilet (có thể null ~51%)
+  scraped_at    Timestamp thu thập (ISO format)
+
+LƯU Ý QUAN TRỌNG
+----------------
+- Dedup trong scraper dùng seen_ids (set in-memory) — chỉ
+  tránh duplicate trong 1 lần chạy.
+- Dedup chính thức trong preprocessing dùng list_id
+  (drop_duplicates(subset=['list_id'])) — đây mới là đúng.
+- Scraper cũ (scrape_chotot.py ở root) dùng cùng logic,
+  scraped_chotot.py là bản trong notebooks/.
+
+
+================================================================
+2. EDA_chotot_scraped.ipynb
+   Vị trí: notebooks/EDA_chotot_scraped.ipynb
+================================================================
+
+MỤC ĐÍCH
+--------
+Phân tích khám phá (Exploratory Data Analysis) toàn diện
+trên chotot_scraped.csv (40,896 listings) trước khi đưa
+vào pipeline preprocessing.
+
+INPUT
+-----
+  data/chotot_scraped.csv   (convert từ JSONL, encoding utf-8-sig)
+
+CẤU TRÚC 7 SECTIONS
+--------------------
+
+Section 1 — Overview & Data Quality
+  - Shape, dtypes, giá trị thiếu theo cột
+  - Biểu đồ Missing Values (%)
+  - Kiểm tra duplicate: list_id và fully duplicate rows
+  - Phân phối listings theo Category và City
+
+  Kết quả:
+    Rows: 40,896  |  Cols: 16
+    Missing: rooms=34.4%, toilets=51%, GPS=0.2%
+    Duplicate list_id: 0  |  Fully duplicate: 0
+
+Section 2 — Phân tích Giá (Price)
+  - Histogram giá raw (clip 50 tỷ) và log(giá)
+  - Bảng outlier: % listings còn lại theo ngưỡng cắt
+  - Boxplot giá theo Category (loại ngoại lệ)
+  - Median giá theo City
+  - Giá/m² theo Category và City
+
+  Kết quả:
+    Mean=7.44 tỷ, Median=4.60 tỷ, Max=480 tỷ
+    > 40 tỷ: ~2% listings
+    Chọn ngưỡng cắt 40 tỷ trong training (R² cao hơn 30 tỷ)
+
+Section 3 — Phân tích Diện tích (Area)
+  - Histogram area (clip 300m²) và phân tách theo Category
+  - Phân phối bimodal: dat_nen có diện tích lớn hơn nhiều
+  - Kiểm tra anomaly: area < 10m², area > 5000m²
+  - Scatter diện tích vs giá (raw + log-log)
+
+  Kết quả:
+    Median=99m² (toàn dataset), nhưng nha_o median~60m²
+    Correlation log(area) vs log(price): r≈0.55
+
+Section 4 — GPS & Location
+  - Kiểm tra GPS availability: 99.8%
+  - Scatter map toàn quốc + zoom HCM, colored by log_price
+  - Ranking quận/huyện theo median giá
+  - Bar chart quận HCM
+
+Section 5 — Phòng ngủ & Toilet
+  - % có dữ liệu theo Category (dat_nen gần như không có)
+  - Histogram số phòng và toilet
+  - Boxplot giá theo số phòng
+  - Correlation rooms/toilets vs log_price
+
+Section 6 — Phân tích Văn bản (Text)
+  - Phân phối độ dài title và description
+  - Top 30 từ phổ biến trong title
+  - 8 keyword flags vs price impact (%):
+      mat_tien: +% so sánh với không có
+      hem_xe_hoi, full_nt, so_hong, ...
+  - Kiểm tra data leakage:
+      ~X% listings đề cập giá trong text ("5 tỷ", "triệu")
+      → Cần remove trước khi TF-IDF
+
+Section 7 — Tổng hợp Correlation
+  - Bar chart Pearson r với log_price cho tất cả numeric features
+  - Heatmap correlation matrix
+  - EDA Summary table
+
+CÁC PHÁT HIỆN QUAN TRỌNG
+-------------------------
+1. Dedup theo (price, area, district) xóa nhầm 24,998 listings
+   → Fix: dùng list_id trong preprocessing_tfidf_v2
+2. Text có đề cập giá → data leakage → cần regex clean
+3. Area bimodal do dat_nen lẫn nha_o/can_ho
+4. 34–51% missing rooms/toilets → cần strategy khi model
+
+
+================================================================
+3. preprocessing_tfidf_v2.ipynb
+   Vị trí: notebooks/preprocessing_tfidf_v2.ipynb
+================================================================
+
+MỤC ĐÍCH
+--------
+Tiền xử lý dữ liệu từ chotot_scraped.jsonl thành feature
+matrix sẵn sàng cho training. Phiên bản v2 sửa lỗi dedup
+so với preprocessing_tfidf.ipynb (v6).
+
+INPUT
+-----
+  data/chotot_scraped.jsonl   (40,896 records)
+
+OUTPUT
+------
+  data/processed_v8/
+    train.parquet               (28,627 rows × 63 cols)
+    val.parquet                 (6,134  rows × 63 cols)
+    test.parquet                (6,135  rows × 63 cols)
+    preprocessing_artifacts.pkl (encoders, scaler, tfidf, svd)
+
+SO SÁNH VỚI V6 (preprocessing_tfidf.ipynb)
+-------------------------------------------
+  V6: drop_duplicates(subset=['price_vnd','area_m2','district'])
+        → giữ 15,898 rows (mất 24,998 listings hợp lệ)
+  V8: drop_duplicates(subset=['list_id'])
+        → giữ 40,896 rows (đúng, dedup theo ID)
+
+CẤU TRÚC CELLS
+--------------
+
+Cell 1 — Setup & Load
+  - Import libraries
+  - INPUT_FILE  = data/chotot_scraped.jsonl
+  - OUTPUT_DIR  = data/processed_v8
+  - Load JSONL → DataFrame raw (40,896 rows)
+
+Cell 2 — Schema mapping & Filter (THAY ĐỔI CHÍNH)
+  - Map: price_vnd, area_m2, latitude, longitude,
+         so_phong_ngu (rooms), so_phong_vs (toilets),
+         title, description, ward, district, city,
+         category_name
+  - Giữ list_id để dedup
+  - Filter: 100M ≤ price ≤ 500B, 0 < area < 10,000
+  - DROP_DUPLICATES(subset=['list_id'])  ← fix chính
+  - Drop cột list_id sau dedup
+  - In: rows còn lại vs v6
+
+Cell 3 — Text Cleaning
+  Loại bỏ trước khi TF-IDF để tránh data leakage:
+    PRICE_PATTERN = r'\d+[.,]?\d*\s*(tỷ|triệu|tr\.?|ty|billion)'
+    PHONE_PATTERN = r'\*+|\b\d{9,11}\b'
+    KEEP_PATTERN  = r'[^a-z<tiếng-việt>\s]'   (giữ chữ có dấu)
+
+  Tạo df['text_clean'] = clean(title + ' ' + description)
+
+Cell 4 — GPS Features
+  Haversine distance tới 4 tâm đô thị:
+    dist_hcm_km  (10.7769, 106.7009)
+    dist_hn_km   (21.0285, 105.8048)
+    dist_dn_km   (16.0544, 108.2022)
+    dist_bd_km   (11.1535, 106.6543)
+  dist_nearest_center_km = min(4 distances)
+  Fill GPS null bằng median district
+
+Cell 5 — BDS Type & Keyword Flags
+  Category mapping:
+    "Nhà ở"                          → nha_o
+    "Căn hộ/Chung cư"               → can_ho
+    "Đất"                            → dat_nen
+    "Văn phòng, Mặt bằng kinh doanh"→ van_phong
+
+  10 keyword binary flags (từ title+description):
+    kw_mat_tien, kw_hem_xe_hoi, kw_full_nt, kw_so_hong,
+    kw_view_song, kw_view_ho, kw_penthouse, kw_biet_thu,
+    kw_chinh_chu, kw_can_ban_gap
+
+Cell 6 — Train/Val/Test Split
+  Stratified random split, random_state=42:
+    train: 70% → 28,627 rows
+    val:   15% →  6,134 rows
+    test:  15% →  6,135 rows
+
+Cell 7 — TF-IDF + LSA (fit trên TRAIN ONLY)
+  TfidfVectorizer:
+    max_features  = 15,000
+    ngram_range   = (1, 2)   unigram + bigram
+    min_df        = 5        bỏ từ < 5 listings
+    sublinear_tf  = True     log(1 + TF)
+    strip_accents = None     giữ dấu tiếng Việt
+
+  TruncatedSVD(n_components=30, random_state=42)
+  → 30 features: lsa_0 … lsa_29
+
+  Fit trên train, transform val/test (tránh leakage vocab)
+
+Cell 8 — Target Encoding (fit trên TRAIN ONLY)
+  Smoothed Target Encoding với K=10:
+
+  district_te:
+    te = log(mean_price_district)
+    fallback = global_mean
+
+  ward_te (smoothed):
+    te = (n × log_ward_mean + 10 × log_district_mean) / (n + 10)
+    fallback: district_te → global_mean
+
+  loc_type_te (smoothed):
+    te = (n × log_mean + 10 × log_district_mean) / (n + 10)
+    key = (district, bds_type)
+    ý nghĩa: giá trung bình của loại BĐS này trong quận này
+
+  OHE bds_type → bds__nha_o, bds__can_ho, bds__dat_nen,
+                  bds__van_phong
+
+Cell 9 — Interaction Features + Scaling
+  Interaction:
+    log_area      = log1p(area_m2)
+    loc_area_inter= district_te × area_m2
+    area_per_room = area_m2 / max(so_phong_ngu, 1)
+
+  RobustScaler (fit trên train):
+    Scale: area_m2, so_phong_ngu, so_phong_vs,
+           title_len, desc_len, latitude, longitude,
+           dist_*_km, log_area, loc_area_inter,
+           area_per_room, lsa_0 … lsa_29
+
+Cell 10 — Save processed_v8
+  Drop: title, description, text_clean, category_name,
+        price_vnd, price_string, scraped_at, city_te
+  Lưu train/val/test.parquet
+  Lưu preprocessing_artifacts.pkl:
+    encoders (ward_te map, district_te map, loc_type_te map)
+    scaler (RobustScaler)
+    tfidf (TfidfVectorizer)
+    svd (TruncatedSVD)
+    feature_cols, scale_cols, gps_city_centers
+
+Cell 11 — So sánh v6 vs v8
+  In bảng: train/val/test rows v6 vs v8 và % tăng
+
+Cell 12 — EDA: Correlation LSA vs log_price
+  Bar chart correlation 30 LSA components vs log_price
+
+FEATURE LIST (63 columns trong processed_v8)
+---------------------------------------------
+  GPS (7):
+    latitude, longitude,
+    dist_hcm_km, dist_hn_km, dist_dn_km, dist_bd_km,
+    dist_nearest_center_km
+
+  Property (3):
+    area_m2, so_phong_ngu, so_phong_vs
+
+  Text length (2):
+    title_len, desc_len
+
+  Keyword flags (10):
+    kw_mat_tien, kw_hem_xe_hoi, kw_full_nt, kw_so_hong,
+    kw_view_song, kw_view_ho, kw_penthouse, kw_biet_thu,
+    kw_chinh_chu, kw_can_ban_gap
+
+  LSA (30):
+    lsa_0 … lsa_29
+
+  Target Encoding (3):
+    ward_te, district_te, loc_type_te
+
+  Category OHE (4):
+    bds__nha_o, bds__can_ho, bds__dat_nen, bds__van_phong
+
+  Interaction (3):
+    log_area, loc_area_inter, area_per_room
+
+  Target (1):
+    log_price   = log1p(price_vnd)
+
+
+================================================================
+4. train_model_tfidf_v2.ipynb
+   Vị trí: notebooks/train_model_tfidf_v2.ipynb
+================================================================
+
+MỤC ĐÍCH
+--------
+Train và đánh giá 4 models hồi quy trên processed_v8.
+So sánh kết quả với baseline models_v4 (GPS only) và
+models_v6 (GPS + TF-IDF, dedup cũ).
+
+INPUT
+-----
+  data/processed_v8/train.parquet   (28,627 rows)
+  data/processed_v8/val.parquet     (6,134  rows)
+  data/processed_v8/test.parquet    (6,135  rows)
+
+OUTPUT
+------
+  models_v8/
+    ridge.pkl
+    random_forest.pkl
+    xgboost.pkl
+    lightgbm.pkl
+    feature_cols.pkl
+    model_comparison.csv
+
+CẤU TRÚC CELLS
+--------------
+
+Cell 1 — Setup & Load
+  DATA_DIR   = data/processed_v8
+  MODELS_DIR = models_v8
+  Import: sklearn, xgboost, lightgbm
+
+Cell 2 — Filter + Feature/Target Split
+  Filter training set:
+    (1) Chỉ giữ nha_o + can_ho (bds__nha_o=1 hoặc bds__can_ho=1)
+    (2) Bỏ outlier giá > 40 tỷ (log_price > log1p(40B))
+
+  Sau filter:
+    train: ~18,200+ rows
+    val:   ~3,900+ rows
+    test:  ~3,900+ rows
+
+  FEATURE_COLS = tất cả cột trừ {log_price, bds__dat_nen,
+                                   bds__van_phong}
+  Fill NaN bằng column median của train
+
+  X_train32, X_val32, X_test32 (float32) cho TabNet
+
+Cell 3 — Metrics Helper
+  Hàm evaluate_model(model, name):
+    RMSLE  = sqrt(MSE(y_log, yp_log))
+    MAPE   = mean(|y_price - yp_price| / y_price) × 100
+    MAE_tỷ = mean(|y_price - yp_price|) / 1e9
+    R²     = r2_score(y_log, yp_log)
+
+  In bảng cho train/val/test splits
+  PredefinedSplit: dùng val làm fold CV (không leak test)
+
+Cell 4 — Model 1: Ridge
+  GridSearchCV alpha ∈ {0.01, 0.1, 1, 10, 100}
+  Fit trên train, predict val/test
+
+Cell 5 — Model 2: Random Forest
+  RandomizedSearchCV (10 iter):
+    n_estimators: [200, 300]
+    max_depth:    [12, 16, None]
+    min_samples_leaf: [1, 2]
+    max_features: ['sqrt', 0.5]
+  oob_score=True
+
+Cell 6 — Model 3: XGBoost
+  n_estimators=800, learning_rate=0.05, max_depth=6
+  subsample=0.8, colsample_bytree=0.8
+  reg_alpha=0.1, reg_lambda=5.0
+  early_stopping_rounds=50, tree_method='hist'
+
+Cell 7 — Model 4: LightGBM
+  n_estimators=1000, learning_rate=0.05, num_leaves=63
+  subsample=0.8, colsample_bytree=0.8
+  reg_alpha=0.1, reg_lambda=5.0
+  min_child_samples=20
+  early_stopping(patience=50)
+
+Cell 8 — Feature Importance
+  XGBoost: gain score → top 20 bar chart
+  LightGBM: gain → top 20 bar chart
+  In: % gain của LSA features vs tổng
+
+Cell 9 — Bảng tổng hợp & Lưu
+  Lưu tất cả models và feature_cols.pkl vào models_v8/
+  model_comparison.csv với các metrics
+
+Cell 10 — So sánh v4 / v6 / v8
+  Load model_comparison.csv từ models_v4, v6, v8
+  Grouped bar chart RMSLE_val và R²_val
+
+KẾT QUẢ (models_v8 — LightGBM tốt nhất)
+-----------------------------------------
+  Model          RMSLE_val  R²_val  MAPE%_val
+  Ridge          0.4724     0.627   40.4%
+  Random Forest  0.4185     0.707   33.8%
+  XGBoost        0.4017     0.730   33.4%
+  LightGBM       0.3980     0.735   33.0%  ← tốt nhất
+
+NHẬN XÉT
+---------
+  - Ridge: underfitting (RMSLE_train ≈ RMSLE_val, cả 2 cao)
+    → Linear model không đủ năng lực cho BĐS
+  - Tree models: overfitting nhẹ
+    (RMSLE_train ~0.15 vs RMSLE_val ~0.40)
+    → Gap lớn nhưng R²_val vẫn tốt, chưa nghiêm trọng
+  - So với v6 (dedup cũ): tất cả models cải thiện R²
+    nhờ tăng data (~2.5x từ ~11k → ~18k sau filter)
+
+================================================================
+  HẾT TÀI LIỆU
+================================================================
